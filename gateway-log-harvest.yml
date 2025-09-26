@@ -1,0 +1,27 @@
+---
+# Harvest AAP 2.5 (RPM) Platform Gateway logs/config and send centrally.
+# Works from an AAP Job Template using the ee-supported execution environment.
+
+- name: Harvest AAP Gateway logs/config
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    log_days: 3
+    work_dir: /tmp/aap_gateway_logs
+    include_web_proxy: true
+    include_redis_supervisor: true
+    ship_mode: "controller"
+    remote_host: "log-collector.example.com"
+    remote_path: "/var/log/aap-gateway-collections"
+    remote_owner: "root"
+    remote_group: "root"
+    remote_mode: "0640"
+
+  tasks:
+    - name: Ensure work directory exists (clean slate)
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: absent
+    # (truncated in this preview — full content as provided earlier)
