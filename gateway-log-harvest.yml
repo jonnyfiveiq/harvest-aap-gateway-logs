@@ -219,7 +219,7 @@
     - name: Fetch tarball back to Controller (controller mode)
       ansible.builtin.fetch:
         src: "{{ tarball_path }}"
-        dest: "artifacts/{{ inventory_hostname }}/"
+        dest: "/runner/artifacts/{{ inventory_hostname }}/"
         flat: true
       when: ship_mode == "controller"
 
