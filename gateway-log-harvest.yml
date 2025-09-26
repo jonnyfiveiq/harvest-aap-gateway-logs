@@ -8,11 +8,22 @@
   gather_facts: false
 
   vars:
+    # How many days of journal logs to collect per service
     log_days: 3
+
+    # Where to stage files on the gateway host before packaging
     work_dir: /tmp/aap_gateway_logs
+
+    # Toggle extra web/proxy logs (nginx/httpd) and redis/supervisord, if present
     include_web_proxy: true
     include_redis_supervisor: true
+
+    # Shipping mode:
+    #   "controller" -> fetch tarball back to Controller (recommended)
+    #   "remote"     -> scp/sftp tarball to a remote host (set remote_* vars)
     ship_mode: "controller"
+
+    # Only used when ship_mode == "remote"
     remote_host: "log-collector.example.com"
     remote_path: "/var/log/aap-gateway-collections"
     remote_owner: "root"
@@ -24,4 +35,198 @@
       ansible.builtin.file:
         path: "{{ work_dir }}"
         state: absent
-    # (truncated in this preview — full content as provided earlier)
+
+    - name: Re-create work directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ work_dir }}"
+        - "{{ work_dir }}/journals"
+        - "{{ work_dir }}/files"
+        - "{{ work_dir }}/configs"
+
+    - name: Discover likely gateway-related systemd services
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Common/observed names across RPM installs; filter actual present units
+        for svc in \
+          automation-gateway \
+          automation-gateway-proxy \
+          platform-gateway \
+          gateway \
+          nginx \
+          httpd \
+          redis \
+          supervisord
+        do
+          systemctl list-units --type=service --all --no-legend | awk '{print $1}' \
+            | grep -E "^${svc}\.service$" || true
+        done | sort -u
+      args:
+        executable: /bin/bash
+      register: svc_scan
+      changed_when: false
+
+    - name: Split services into core gateway and optional sets
+      ansible.builtin.set_fact:
+        gateway_core_services: >-
+          {{ svc_scan.stdout_lines | select('match', '^(automation-gateway|platform-gateway|gateway)') | list }}
+        proxy_services: >-
+          {{ svc_scan.stdout_lines | select('match', '^(nginx|httpd)') | list }}
+        aux_services: >-
+          {{ svc_scan.stdout_lines | select('match', '^(redis|supervisord)') | list }}
+
+    - name: Fail if no gateway-like services were found
+      ansible.builtin.fail:
+        msg: >
+          No platform gateway services were found on this host. Discovered: {{ svc_scan.stdout_lines | default([]) }}
+          If this node isn't the gateway, target the correct host.
+      when: gateway_core_services | length == 0
+
+    - name: Collect journald for core gateway services (since last {{ log_days }} days)
+      ansible.builtin.shell: |
+        set -o pipefail
+        journalctl -u {{ item }} --since "-{{ log_days }} days" --no-pager --output=short-iso > "{{ work_dir }}/journals/{{ item }}.log" || true
+      args:
+        executable: /bin/bash
+      loop: "{{ gateway_core_services }}"
+      changed_when: false
+
+    - name: Collect journald for proxy services (optional)
+      ansible.builtin.shell: |
+        set -o pipefail
+        journalctl -u {{ item }} --since "-{{ log_days }} days" --no-pager --output=short-iso > "{{ work_dir }}/journals/{{ item }}.log" || true
+      args:
+        executable: /bin/bash
+      loop: "{{ include_web_proxy | ternary(proxy_services, []) }}"
+      when: include_web_proxy
+      changed_when: false
+
+    - name: Collect journald for redis/supervisord (optional)
+      ansible.builtin.shell: |
+        set -o pipefail
+        journalctl -u {{ item }} --since "-{{ log_days }} days" --no-pager --output=short-iso > "{{ work_dir }}/journals/{{ item }}.log" || true
+      args:
+        executable: /bin/bash
+      loop: "{{ include_redis_supervisor | ternary(aux_services, []) }}"
+      when: include_redis_supervisor
+      changed_when: false
+
+    - name: Candidate log directories to capture if present
+      ansible.builtin.set_fact:
+        candidate_dirs:
+          - /var/log/automation-gateway
+          - /var/log/platform-gateway
+          - /var/log/gateway
+          - /var/log/nginx
+          - /var/log/httpd
+          - /var/log/redis
+          - /var/log/supervisor
+          - /var/log/tower  # controller logs sometimes contain gateway proxied requests on RPM installs
+
+    - name: Copy any existing log directories
+      ansible.builtin.shell: |
+        set -o pipefail
+        d="{{ item }}"
+        if [ -d "$d" ]; then
+          dest="{{ work_dir }}/files$(echo "$d" | sed 's#/#_#g')"
+          mkdir -p "$(dirname "$dest")"
+          tar -C "$(dirname "$d")" -cf - "$(basename "$d")" | tar -C "{{ work_dir }}/files" -xf -
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ candidate_dirs }}"
+      changed_when: false
+
+    - name: Candidate config directories to capture if present
+      ansible.builtin.set_fact:
+        candidate_cfg_dirs:
+          - /etc/automation-gateway
+          - /etc/platform-gateway
+          - /etc/gateway
+          - /etc/nginx
+          - /etc/httpd
+          - /etc/supervisord.d
+          - /etc/systemd/system  # to capture drops-in for gateway units
+
+    - name: Copy any existing config directories
+      ansible.builtin.shell: |
+        set -o pipefail
+        d="{{ item }}"
+        if [ -d "$d" ]; then
+          tar -C "$(dirname "$d")" -cf - "$(basename "$d")" | tar -C "{{ work_dir }}/configs" -xf -
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ candidate_cfg_dirs }}"
+      changed_when: false
+
+    - name: Create manifest with environment info
+      ansible.builtin.shell: |
+        {
+          echo "host: {{ inventory_hostname }}"
+          echo "timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "log_days: {{ log_days }}"
+          echo "gateway_core_services: {{ gateway_core_services | join(', ') }}"
+          echo "proxy_services: {{ proxy_services | join(', ') }}"
+          echo "aux_services: {{ aux_services | join(', ') }}"
+          echo "uname: $(uname -a)"
+          echo "os-release:"; cat /etc/os-release 2>/dev/null || true
+          echo "systemd units:"; systemctl list-units --type=service --all --no-pager | sed 's/[[:space:]]\+/ /g'
+        } > "{{ work_dir }}/MANIFEST.txt"
+      args:
+        executable: /bin/bash
+
+    - name: Build tarball
+      ansible.builtin.shell: |
+        set -o pipefail
+        out="/tmp/{{ inventory_hostname }}-aap-gateway-logs-$(date +%Y%m%d%H%M%S).tar.gz"
+        tar -C "{{ work_dir }}" -czf "$out" .
+        echo "$out"
+      args:
+        executable: /bin/bash
+      register: tarball_cmd
+
+    - name: Register tarball path
+      ansible.builtin.set_fact:
+        tarball_path: "{{ tarball_cmd.stdout | trim }}"
+
+    # --- Shipping options ---
+
+    - name: Ensure remote destination exists (remote mode)
+      ansible.builtin.file:
+        path: "{{ remote_path }}"
+        state: directory
+        owner: "{{ remote_owner }}"
+        group: "{{ remote_group }}"
+        mode: "0750"
+      when: ship_mode == "remote"
+      delegate_to: "{{ remote_host }}"
+      run_once: true
+
+    - name: Push tarball to remote collector (remote mode)
+      ansible.builtin.copy:
+        src: "{{ tarball_path }}"
+        dest: "{{ remote_path }}/"
+        owner: "{{ remote_owner }}"
+        group: "{{ remote_group }}"
+        mode: "{{ remote_mode }}"
+      when: ship_mode == "remote"
+      delegate_to: "{{ remote_host }}"
+
+    - name: Fetch tarball back to Controller (controller mode)
+      ansible.builtin.fetch:
+        src: "{{ tarball_path }}"
+        dest: "artifacts/{{ inventory_hostname }}/"
+        flat: true
+      when: ship_mode == "controller"
+
+    - name: Cleanup working dir and local tarball
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ work_dir }}"
+        - "{{ tarball_path }}"
